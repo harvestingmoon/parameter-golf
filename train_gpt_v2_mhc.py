@@ -394,6 +394,7 @@ def eval_val_sliding(
 
             if rank == 0 and (bi // batch_seqs) % 50 == 0:
                 done = min(bi + batch_seqs, len(my_windows))
+                pct = 100.0 * done / max(len(my_windows), 1)
                 rl = (loss_sum / token_count).item() if token_count.item() > 0 else 0.0
                 running_bpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1))
                 print(f"  sliding_eval [{pct:5.1f}%] {done}/{len(my_windows)} windows running_bpb={running_bpb:.6f}", flush=True)

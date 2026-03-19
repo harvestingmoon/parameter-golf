@@ -5,14 +5,22 @@
 # NUM_LAYERS=12 MLP_HIDDEN=512 QUANT_AUTO_BUDGET_MB=15.0 \
 # python3 train_gpt_v2.py 2>&1 | tee logs/baseline_12L.txt
 
-# 2) DEEPER baseline (20L, wider MLP, no MHC)
+# 2) DEEPER baseline (20L, wider MLP, no MHC) (3:1 ratio)
 # RUN_ID=deeper_20L \
 # ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
 # VAL_LOSS_EVERY=50 VAL_BATCH_SIZE=65536 EVAL_STRIDE=512 EVAL_BATCH_SEQS=8 \
 # NUM_LAYERS=20 MLP_HIDDEN=768 QUANT_AUTO_BUDGET_MB=15.0 \
-# python3 train_gpt_v2.py 2>&1 | tee logs/deeper_20L.txt
+# python3 train_gpt_v2_mhc.py
 
-# 3) MHC N=2 streams, 20L (lightest MHC — 2×2 matrices per block, ~negligible param overhead)
+# 2b) 1:1 GDN:attn ratio — ATTN_EVERY=2 → 10 GDN : 10 attn
+RUN_ID=attn_every2_1to1 \
+ATTN_EVERY=2 \
+ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
+VAL_LOSS_EVERY=50 VAL_BATCH_SIZE=65536 EVAL_STRIDE=512 EVAL_BATCH_SEQS=8 \
+NUM_LAYERS=20 MLP_HIDDEN=768 QUANT_AUTO_BUDGET_MB=15.0 \
+python3 train_gpt_v2_mhc.py 2>&1 | tee logs/attn_every2_1to1.txt
+
+# MHC N=2 streams, 20L (lightest MHC — 2×2 matrices per block, ~negligible param overhead)
 # RUN_ID=mhc_n2_20L \
 # HC_STREAMS=2 \
 # ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
@@ -20,21 +28,13 @@
 # NUM_LAYERS=20 MLP_HIDDEN=768 QUANT_AUTO_BUDGET_MB=15.0 \
 # python3 train_gpt_v2_mhc.py
 
-# 4) MHC N=4 streams, 20L 
+# MHC N=4 streams, 20L 
 # RUN_ID=mhc_n4_20L \
 # HC_STREAMS=4 \
 # ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
 # VAL_LOSS_EVERY=50 VAL_BATCH_SIZE=65536 EVAL_STRIDE=512 EVAL_BATCH_SEQS=8 \
 # NUM_LAYERS=20 MLP_HIDDEN=768 QUANT_AUTO_BUDGET_MB=15.0 \
 # python3 train_gpt_v2.py 2>&1 | tee logs/mhc_n4_20L.txt
-
-# ── FULL TRAINING (10-min budget, uncomment for real runs) ────────────────────
-RUN_ID=mhc_n4_20L_full \
-ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
-VAL_LOSS_EVERY=50 VAL_BATCH_SIZE=65536 EVAL_STRIDE=512 EVAL_BATCH_SEQS=8 \
-HC_STREAMS=4 NUM_LAYERS=20 MLP_HIDDEN=768 \
-QUANT_AUTO_BUDGET_MB=15.0 MAX_WALLCLOCK_SECONDS=600 \
-python3 train_gpt_v2_mhc.py 2>&1
 
 #  sed -i 's/\r//' run.sh
 # MODEL_DIM=512 \

@@ -11,3 +11,5 @@ data/docs_selected.jsonl
 logs/
 GatedDeltaNet/
 sota.py
+references
+sota_v2.py

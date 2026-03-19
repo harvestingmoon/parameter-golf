@@ -785,7 +785,7 @@ class GatedDeltaNet(nn.Module):
         self.head_v_dim = self.value_dim // num_heads
 
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, self.key_dim_per_group, bias=False)
 
         self.v_proj = nn.Linear(hidden_size, self.value_dim_per_group, bias=False)
         self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
@@ -1128,6 +1128,11 @@ def main() -> None:
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+
+    # Persistent compilation cache — compiles once, reuses on every subsequent run
+    torch._inductor.config.fx_graph_cache = True
+    torch._inductor.config.fx_graph_remote_cache = False
+    torch._inductor.config.autotune_local_cache = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
@@ -1207,7 +1212,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False, options={"triton.persistent_reductions": False})
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:

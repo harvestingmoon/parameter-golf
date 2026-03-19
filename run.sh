@@ -1,6 +1,11 @@
-RUN_ID=smoke_test
-ITERATIONS=200
-TRAIN_BATCH_TOKENS=8192
-VAL_LOSS_EVERY=0
-VAL_BATCH_SIZE=8192
-python3 train_gpt_v2.py
+RUN_ID=smoke_test \
+ITERATIONS=200 \
+TRAIN_BATCH_TOKENS=65536 \
+VAL_LOSS_EVERY=50 \
+VAL_BATCH_SIZE=65536 \
+NUM_LAYERS=12 \
+MLP_MULT=1 \
+ATTN_EVERY=2 \
+python3 sota.py
+
+#  sed -i 's/\r//' run.sh  

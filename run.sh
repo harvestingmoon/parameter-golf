@@ -1,3 +1,13 @@
+# ── Launcher: NPROC=1 → python3, NPROC>1 → torchrun ──────────────────────────
+# Usage:  NPROC=8 LARGE_GPU=1 bash run.sh
+# For 8xH100 also set GRAD_ACCUM_TARGET=8 (or omit — default keeps same effective batch).
+NPROC=${NPROC:-1}
+if [ "$NPROC" -gt 1 ]; then
+    LAUNCHER="torchrun --nproc_per_node=$NPROC --standalone"
+else
+    LAUNCHER="python3"
+fi
+
 # 1) BASELINE smoke test (12L, no MHC)
 # RUN_ID=baseline_12L \
 # ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
@@ -58,7 +68,7 @@ BACKOUT_ENABLED=0 BACKOUT_LAMBDA_INIT=0.2 BACKOUT_LAYER=-1 \
 USE_ADAMUON=1 ADAMUON_BETA2=0.95 \
 USE_ATTNRES=1 \
 ATTNRES_BLOCK_SIZE=4 \
-python3 train_gpt_smear_attn.py 
+$LAUNCHER train_gpt_smear_attn.py 
 
 # ema == does it recover meaningful bpb after int6 quant?
 # ln_scale == signal dampening

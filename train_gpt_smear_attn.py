@@ -125,6 +125,13 @@ class Hyperparameters:
     #   block_size=4 → boundary every 2 layers; block_size=2 → every 1 layer.
     use_attnres = bool(int(os.environ.get("USE_ATTNRES", "0")))
     attnres_block_size = int(os.environ.get("ATTNRES_BLOCK_SIZE", "4"))  # 4=2 layers/block
+    # LARGE_GPU: disable laptop-GPU Inductor workarounds (persistent_reductions=False, max_fusion_size=64).
+    # Set LARGE_GPU=1 when training on H100/A100/3090+ with ample registers.
+    large_gpu = bool(int(os.environ.get("LARGE_GPU", "0")))
+    # GRAD_ACCUM_TARGET: total gradient-accumulation steps with 1 GPU.
+    # With N GPUs: grad_accum_steps = max(1, grad_accum_target // N).
+    # Default 8 keeps single-GPU behaviour unchanged; set equal to NPROC for no accum.
+    grad_accum_target = int(os.environ.get("GRAD_ACCUM_TARGET", "8"))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -1196,9 +1203,7 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    grad_accum_steps = max(1, args.grad_accum_target // world_size)
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1214,8 +1219,9 @@ def main() -> None:
     torch._inductor.config.fx_graph_cache = True
     torch._inductor.config.fx_graph_remote_cache = False
     torch._inductor.config.autotune_local_cache = True
-    torch._inductor.config.triton.persistent_reductions = False  # laptop GPU has insufficient registers
-    torch._inductor.config.max_fusion_size = 64  # cap kernel size to avoid register overflow on small GPUs
+    if not args.large_gpu:
+        torch._inductor.config.triton.persistent_reductions = False  # laptop GPU has insufficient registers
+        torch._inductor.config.max_fusion_size = 64  # cap kernel size to avoid register overflow on small GPUs
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)

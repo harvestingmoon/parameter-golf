@@ -12,21 +12,6 @@
 # NUM_LAYERS=20 MLP_HIDDEN=768 QUANT_AUTO_BUDGET_MB=15.0 \
 # python3 train_gpt_v2_mhc.py
 
-# 2b) 1:1 GDN:attn ratio — best architecture (defaults baked into train_gpt_mamba_delta.py)
-# RUN_ID=attn_every2_1to1 \
-# ATTN_EVERY=2 \
-# ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
-# VAL_LOSS_EVERY=50 VAL_BATCH_SIZE=65536 EVAL_STRIDE=512 EVAL_BATCH_SEQS=8 \
-# NUM_LAYERS=20 MLP_HIDDEN=768 QUANT_AUTO_BUDGET_MB=15.0 \
-# python3 train_gpt_v2_mhc.py 2>&1 | tee logs/attn_every2_1to1.txt
-
-# ── ACTIVE: mamba_delta — 1:1 ratio, stride=64, batch=32, no MHC ─────────────
-# RUN_ID=mamba_delta_1to1 \
-# ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
-# VAL_LOSS_EVERY=50 VAL_BATCH_SIZE=65536 \
-# QUANT_AUTO_BUDGET_MB=15.0 MAX_WALLCLOCK_SECONDS=600 \
-# python3 train_gpt_mamba_delta.py 2>&1 | tee logs/mamba_delta_1to1.txt
-
 # ── smear_gdn_v1 — SmearGate + MuonWD + int6 MLP (20L, mlp=768) ──────────────
 # RUN_ID=smear_gdn_v1 \
 # ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
@@ -34,27 +19,82 @@
 # QUANT_AUTO_BUDGET_MB=15.0 MAX_WALLCLOCK_SECONDS=600 \
 # python3 train_gpt_smear_gdn.py 2>&1 | tee logs/smear_gdn_v1.txt
 
-# ── ACTIVE: wide_mlp — 11L, dim=512, MLP=1536 (3×), int6 MLP, GDN backend ────
-# RUN_ID=wide_mlp_11L \
-# NUM_LAYERS=11 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 MLP_HIDDEN=1536 \
-# ATTN_EVERY=2 MLP_INT6=1 SSM_BACKEND=gdn \
-# ITERATIONS=200 TRAIN_BATCH_TOKENS=65536 \
-# VAL_LOSS_EVERY=50 VAL_BATCH_SIZE=65536 \
+
+# Plain ReLU² MLP (original):  USE_SWIGLU=0 USE_BAYES_MLP=0  MLP_HIDDEN=1536
+# SwiGLU (iso-param):          USE_SWIGLU=1                   MLP_HIDDEN=1536  (auto hidden = 1024)
+# SwiGLU (explicit hidden):    USE_SWIGLU=1 SWIGLU_HIDDEN=1024
+# Bayesian ReLU²:              USE_BAYES_MLP=1                MLP_HIDDEN=1536
+# Bayesian SwiGLU:             USE_BAYES_MLP=1 USE_SWIGLU=1   MLP_HIDDEN=1536  (both flags → BayesianSwiGLUMLP)
+
+
+# RUN_ID=plain_mlp_1536 \
+# NUM_LAYERS=20 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 MLP_HIDDEN=1536 \
+# MLP_INT6=1 \
+# USE_SWIGLU=0 USE_BAYES_MLP=0 \
+# TRAIN_BATCH_TOKENS=65536 TRAIN_SEQ_LEN=1024 \
+# ITERATIONS=20000 WARMDOWN_ITERS=3000 WARMUP_STEPS=20 \
+# VAL_LOSS_EVERY=1000 VAL_BATCH_SIZE=65536 \
 # QUANT_AUTO_BUDGET_MB=15.0 MAX_WALLCLOCK_SECONDS=600 \
-# EVAL_STRIDE=0 \
-# python3 train_gpt_smear_gdn_mamba.py
+# EMA_ENABLED=0 EMA_DECAY=0.999 \
+# LN_SCALE=0 \
+# BACKOUT_ENABLED=0 BACKOUT_LAMBDA_INIT=0.2 BACKOUT_LAYER=-1 \
+# USE_ADAMUON=0 ADAMUON_BETA2=0.95 \
+# python3 train_gpt_smear_attn.py 2>&1 | tee logs/plain_mlp_1536.txt
 
+# ── SwiGLU iso-param (1536 MLP_HIDDEN → auto hidden=1024, same param count) ──
+RUN_ID=swiglu_1536 \
+NUM_LAYERS=11 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 MLP_HIDDEN=1536 \
+MLP_INT6=1 \
+USE_SWIGLU=1 USE_BAYES_MLP=1 \
+NOPE_RATIO=0.25 \
+USE_ALIBI=0 \
+TRAIN_BATCH_TOKENS=65536 TRAIN_SEQ_LEN=1024 \
+ITERATIONS=200 WARMDOWN_ITERS=3000 WARMUP_STEPS=20 \
+VAL_LOSS_EVERY=1000 VAL_BATCH_SIZE=65536 \
+QUANT_AUTO_BUDGET_MB=15.0 MAX_WALLCLOCK_SECONDS=600 \
+EMA_ENABLED=0 EMA_DECAY=0.999 \
+LN_SCALE=0 \
+BACKOUT_ENABLED=0 BACKOUT_LAMBDA_INIT=0.2 BACKOUT_LAYER=-1 \
+USE_ADAMUON=1 ADAMUON_BETA2=0.95 \
+USE_ATTNRES=1 \
+ATTNRES_BLOCK_SIZE=4 \
+python3 train_gpt_smear_attn.py 
 
-#python3 smear_gate.py
+# ema == does it recover meaningful bpb after int6 quant?
+# ln_scale == signal dampening
+# backout == 1 learned scalar subtract improve u net ? 
 
-#  sed -i 's/\r//' run.sh
-# MODEL_DIM=512 \
-# ATTN_EVERY=4 \
-# QUANT_AUTO_BUDGET_MB=15.0 \
+# RUN_ID=sota_112.py
+# ENABLE_TORCH_COMPILE=1 \
 # ITERATIONS=200 \
+# VAL_LOSS_EVERY=20 \
+# TRAIN_LOG_EVERY=200 \
 # TRAIN_BATCH_TOKENS=65536 \
-# VAL_LOSS_EVERY=50 \
 # VAL_BATCH_SIZE=65536 \
-# EVAL_STRIDE=512 \
-# EVAL_BATCH_SEQS=8 \
-# python3 train_gpt_v2.py 2>&1 | tee logs/wider_deeper_20L.txt
+# MAX_WALLCLOCK_SECONDS=600 \
+# TRAIN_SEQ_LEN=1024 \
+# EVAL_SEQ_LEN=1024 \
+# EVAL_STRIDE=64 \
+# NUM_LAYERS=11 \
+# BIGRAM_VOCAB_SIZE=1024 \
+# XSA_LAST_N=4 \
+# EMA_ENABLED=1 \
+# EMA_DECAY=0.997 \
+# SWA_ENABLED=0 \
+# ROPE_DIMS=16 \
+# LN_SCALE=1 \
+# LATE_QAT=1 \
+# BACKOUT_ENABLED=1 \
+# BACKOUT_LAMBDA_INIT=0.2 \
+# BACKOUT_LAYER=-1 \
+# QAT_THRESHOLD=0.1 \
+# MUON_WD=0.04 \
+# ADAM_WD=0.04 \
+# MATRIX_LR=0.025 \
+# SCALAR_LR=0.025 \
+# TIED_EMBED_LR=0.035 \
+# MUON_MOMENTUM=0.99 \
+# MUON_MOMENTUM_WARMUP_START=0.92 \
+# MUON_MOMENTUM_WARMUP_STEPS=1500 \
+# WARMDOWN_ITERS=3000 \
+# python sota_112.py

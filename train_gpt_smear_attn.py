@@ -12,6 +12,11 @@ import time
 import uuid
 import zlib
 from pathlib import Path
+try:
+    import zstandard as _zstd  # pip install zstandard
+    _HAS_ZSTD = True
+except ImportError:
+    _HAS_ZSTD = False
 
 import numpy as np
 import sentencepiece as spm
@@ -80,6 +85,11 @@ class Hyperparameters:
     int6_step   = int(os.environ.get("INT6_STEP", 4))
     quant_auto_budget_mb = float(os.environ.get("QUANT_AUTO_BUDGET_MB", 0.0))
     mlp_int6 = bool(int(os.environ.get("MLP_INT6", "1")))  # force ALL MLP params to int6 tier
+    attn_int6 = bool(int(os.environ.get("ATTN_INT6", "1")))  # force ALL attn projection params to int6 tier
+    # Embeddings always stay at int8 per-row (no int6 override for tok_emb / lm_head).
+    # DISABLE_INT4=1: skip the int4 tier entirely — auto-budget only assigns int8/int6.
+    # Combined with MLP_INT6=1 + ATTN_INT6=1 this gives a pure int6/int8 mixed-precision checkpoint.
+    disable_int4 = bool(int(os.environ.get("DISABLE_INT4", "0")))
     # Bayesian MLP: replaces MLP with weight-noise version (local reparameterization trick).
     # At eval/save time the forward is fully deterministic (mean weights only).
     use_bayes_mlp = bool(int(os.environ.get("USE_BAYES_MLP", "0")))
@@ -125,6 +135,14 @@ class Hyperparameters:
     #   block_size=4 → boundary every 2 layers; block_size=2 → every 1 layer.
     use_attnres = bool(int(os.environ.get("USE_ATTNRES", "0")))
     attnres_block_size = int(os.environ.get("ATTNRES_BLOCK_SIZE", "4"))  # 4=2 layers/block
+    # BigramHashEmbedding: hash consecutive token pairs → lookup table → add to tok_emb.
+    # Captures local bigram context without enlarging vocab. BIGRAM_BUCKETS should be power-of-2.
+    use_bigram = bool(int(os.environ.get("USE_BIGRAM", "0")))
+    bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", "2048"))  # hash table size (power-of-2)
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", "128"))           # embedding dim (projected → model_dim)
+    # Shared value embedding: one V projection matrix shared across ALL attention layers.
+    # Reduces V-params from num_layers × kv_dim × model_dim  →  1 × kv_dim × model_dim.
+    use_shared_value_emb = bool(int(os.environ.get("USE_SHARED_VALUE_EMB", "0")))
     # LARGE_GPU: disable laptop-GPU Inductor workarounds (persistent_reductions=False, max_fusion_size=64).
     # Set LARGE_GPU=1 when training on H100/A100/3090+ with ample registers.
     large_gpu = bool(int(os.environ.get("LARGE_GPU", "0")))
@@ -791,7 +809,7 @@ class AttnRes(nn.Module):
                 partial = torch.zeros_like(partial)
 
             # ③ Attention sub-layer (resid_mix bypassed; h is the aggregated context)
-            attn_out = block.attn(block.attn_norm(h) * s)
+            attn_out = block.attn(block.attn_norm(h) * s, shared_v_proj=shared_v_proj)
             partial = partial + block.attn_scale.to(dtype=h.dtype)[None, None, :] * attn_out
 
             # ④ Inter-block depth attention → aggregated context for MLP sub-layer
@@ -816,6 +834,7 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         nope_heads: int = 0,  # number of heads that skip RoPE (NoPE)
         use_alibi: bool = False,
+        use_shared_v: bool = False,  # skip per-layer c_v; shared_v_proj passed through forward
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -837,7 +856,7 @@ class CausalSelfAttention(nn.Module):
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v: CastedLinear | None = None if use_shared_v else CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -848,11 +867,12 @@ class CausalSelfAttention(nn.Module):
             self.alibi = None
             self.rotary = Rotary(self.head_dim, base=rope_base) if self.rope_heads > 0 else None
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, shared_v_proj: "CastedLinear | None" = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        _v_proj = shared_v_proj if self.c_v is None else self.c_v
+        v = _v_proj(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
@@ -1011,6 +1031,40 @@ class SmearGate(nn.Module):
         return x + g[None, None, :] * (x_prev - x)
 
 
+class BigramHashEmbedding(nn.Module):
+    """Learnable bigram hash embedding added to token embeddings before RMSNorm.
+
+    For position i > 0: hashes (token[i-1], token[i]) to a bucket in [0, bigram_buckets-1]
+    and retrieves a learned vector. Position 0 uses a fixed fallback bucket.
+    Output is projected to model_dim (when bigram_dim != model_dim) and multiplied by a
+    learned scale initialised to 0.05 → near-zero at start, grows if useful.
+    BIGRAM_BUCKETS should be a power of 2 (default 2048).
+    """
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod  # position 0: no previous token → fallback bucket
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
 class Block(nn.Module):
     """Transformer block with resid_mix scalar gating and U-Net skip connections."""
     def __init__(
@@ -1030,12 +1084,13 @@ class Block(nn.Module):
         use_swiglu: bool = False,
         swiglu_hidden: int = 0,
         ln_scale: bool = False,
+        use_shared_v: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         # All blocks use standard GQA (CausalSelfAttention); attn_every/block_idx kept for API compat
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, nope_heads=nope_heads, use_alibi=use_alibi)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, nope_heads=nope_heads, use_alibi=use_alibi, use_shared_v=use_shared_v)
         _swiglu_h = swiglu_hidden if swiglu_hidden > 0 else max(1, round(mlp_hidden * 2 / 3))
         if use_bayes_mlp and use_swiglu:
             self.mlp = BayesianSwiGLUMLP(dim, _swiglu_h, prior_log_sigma)
@@ -1051,11 +1106,11 @@ class Block(nn.Module):
         # LN_SCALE: dampen normed activations by 1/sqrt(depth) to stabilize deep layers
         self.ln_scale_factor = 1.0 / math.sqrt(block_idx + 1) if ln_scale else 1.0
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, shared_v_proj: "CastedLinear | None" = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         s = self.ln_scale_factor
-        attn_out = self.attn(self.attn_norm(x) * s)
+        attn_out = self.attn(self.attn_norm(x) * s, shared_v_proj=shared_v_proj)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
         return x
@@ -1089,6 +1144,10 @@ class GPT(nn.Module):
         backout_layer: int = -1,
         use_attnres: bool = False,
         attnres_block_size: int = 4,
+        use_bigram: bool = False,
+        bigram_buckets: int = 2048,
+        bigram_dim: int = 128,
+        use_shared_value_emb: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1098,6 +1157,15 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.smear = SmearGate(model_dim)
+        # BigramHashEmbedding: bigram context added to tok_emb before RMSNorm.
+        self.bigram: BigramHashEmbedding | None = (
+            BigramHashEmbedding(bigram_buckets, bigram_dim, model_dim) if use_bigram else None
+        )
+        # Shared V projection: one matrix shared by all attn layers (use_shared_v=True in each Block).
+        _kv_dim = num_kv_heads * (model_dim // num_heads)
+        self.shared_v_proj: CastedLinear | None = (
+            CastedLinear(model_dim, _kv_dim, bias=False) if use_shared_value_emb else None
+        )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -1127,6 +1195,7 @@ class GPT(nn.Module):
                     use_swiglu=use_swiglu,
                     swiglu_hidden=swiglu_hidden,
                     ln_scale=ln_scale,
+                    use_shared_v=use_shared_value_emb,
                 )
                 for i in range(num_unique_blocks)
             ]
@@ -1149,15 +1218,16 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def _run_blocks(self, x: Tensor) -> Tensor:
+        svp = self.shared_v_proj  # None or a shared CastedLinear for V projection
         if self.attnres is not None:
             # Kimi AttnRes mode: all blocks run linearly with inter-block depth attention.
             # The U-Net encoder/decoder split and skip connections are fully bypassed.
-            return self.attnres(self.blocks, x)
+            return self.attnres(self.blocks, x, shared_v_proj=svp)
         x0 = x
         skips: list[Tensor] = []
         x_backout: Tensor | None = None
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, svp)
             skips.append(x)
             if self.backout_lambda is not None and i == self.backout_layer:
                 x_backout = x
@@ -1165,7 +1235,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             blk_idx = (self.num_encoder_layers - 1 - i) if self.share_weights else (self.num_encoder_layers + i)
-            x = self.blocks[blk_idx](x, x0)
+            x = self.blocks[blk_idx](x, x0, svp)
             if self.backout_lambda is not None and (self.num_encoder_layers + i) == self.backout_layer:
                 x_backout = x
         if x_backout is not None and self.backout_lambda is not None:
@@ -1173,7 +1243,10 @@ class GPT(nn.Module):
         return x
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
+        x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x = self.final_norm(self._run_blocks(x)).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1183,7 +1256,10 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits [bsz, seq_len, vocab] without loss (for sliding-window eval)."""
-        x = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
+        x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x = self.final_norm(self._run_blocks(x))
         logits_proj = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
@@ -1310,6 +1386,10 @@ def main() -> None:
         backout_layer=args.backout_layer,
         use_attnres=args.use_attnres,
         attnres_block_size=args.attnres_block_size,
+        use_bigram=args.use_bigram,
+        bigram_buckets=args.bigram_buckets,
+        bigram_dim=args.bigram_dim,
+        use_shared_value_emb=args.use_shared_value_emb,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1335,9 +1415,20 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.backout_lambda is not None:
         scalar_params.append(base_model.backout_lambda)
+    # Shared V projection → matrix (Muon/AdaMuon)
+    if base_model.shared_v_proj is not None:
+        matrix_params.append(base_model.shared_v_proj.weight)
+    # Bigram: embed.weight → tok Adam; proj.weight → matrix Muon; scale → scalar Adam
+    if base_model.bigram is not None:
+        if base_model.bigram.proj is not None:
+            matrix_params.append(base_model.bigram.proj.weight)
+        scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    _tok_emb_params = [base_model.tok_emb.weight]
+    if base_model.bigram is not None:
+        _tok_emb_params.append(base_model.bigram.embed.weight)
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": _tok_emb_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1649,10 +1740,11 @@ def main() -> None:
             args.num_layers, args.quant_auto_budget_mb, code_bytes_est
         )
         # Only use auto sets if user didn't provide explicit ones
-        if not int4_set:
+        if not int4_set and not args.disable_int4:
             int4_set = int4_set_auto
         if not int6_set:
-            int6_set = int6_set_auto
+            # When int4 is disabled, promote those layers into int6
+            int6_set = int6_set_auto | (int4_set_auto if args.disable_int4 else set())
         log0(
             f"quant_auto_budget_mb:{args.quant_auto_budget_mb:.1f} "
             f"int8_layers:{sorted(set(range(args.num_layers)) - int4_set - int6_set)} "
@@ -1680,11 +1772,22 @@ def main() -> None:
                 t = quant_obj["quantized"][nm]
                 quant_obj["quantized"][nm] = ((t.float() / args.int6_step).round() * args.int6_step).clamp(-127, 127).to(torch.int8)
         log0(f"quant_mlp_int6: forced all MLP params to step:{args.int6_step} (overrides per-layer int4)")
+    if args.attn_int6:
+        for nm in list(quant_obj.get("quantized", {}).keys()):
+            if ".attn." in nm and "tok_emb" not in nm and "lm_head" not in nm:
+                t = quant_obj["quantized"][nm]
+                quant_obj["quantized"][nm] = ((t.float() / args.int6_step).round() * args.int6_step).clamp(-127, 127).to(torch.int8)
+        log0(f"quant_attn_int6: forced all attention projection params to step:{args.int6_step}")
 
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    if _HAS_ZSTD:
+        quant_blob = _zstd.ZstdCompressor(level=22).compress(quant_raw)
+        _compress_tag = "zstd-22"
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
+        _compress_tag = "zlib-9"
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1693,15 +1796,19 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int8+{_compress_tag}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+{_compress_tag}: {quant_file_bytes + code_bytes} bytes")
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    if _HAS_ZSTD:
+        quant_raw_disk = _zstd.ZstdDecompressor().decompress(quant_blob_disk)
+    else:
+        quant_raw_disk = zlib.decompress(quant_blob_disk)
+    quant_state = torch.load(io.BytesIO(quant_raw_disk), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(

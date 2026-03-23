@@ -42,6 +42,9 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    # LR_WARMUP_STEPS: linear LR ramp from 0→1 over this many MAIN training steps.
+    # Separate from WARMUP_STEPS (which is the ghost optimizer pre-warm that resets after).
+    lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 0))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -57,8 +60,13 @@ class Hyperparameters:
     attn_every = int(os.environ.get("ATTN_EVERY", 2))  # 1=all-attn, 2=1:1, 4=3:1 GDN
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    nope_ratio = float(os.environ.get("NOPE_RATIO", 0.0))  # fraction of attn heads that skip RoPE (NoPE)
+    nope_ratio = float(os.environ.get("NOPE_RATIO", 0.0))  # fraction of attn heads / blocks that skip RoPE
+    nope_mode = os.environ.get("NOPE_MODE", "head")  # "head" | "block"
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    label_smoothing = float(os.environ.get("LABEL_SMOOTHING", 0.0))  # 0 = off, e.g. 0.1
+    # FOCAL_GAMMA: focal loss exponent (1-p_t)^gamma weighting per token.
+    # 0.0 = plain cross-entropy (default). 0.5-2.0 = down-weight easy tokens.
+    focal_gamma = float(os.environ.get("FOCAL_GAMMA", 0.0))
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -143,6 +151,11 @@ class Hyperparameters:
     # Shared value embedding: one V projection matrix shared across ALL attention layers.
     # Reduces V-params from num_layers × kv_dim × model_dim  →  1 × kv_dim × model_dim.
     use_shared_value_emb = bool(int(os.environ.get("USE_SHARED_VALUE_EMB", "0")))
+    # Backward-looking LoRA: low-rank adapter on MLP output that reads the PREVIOUS token's
+    # hidden state (x shifted right by 1). A learned switch scalar gates each block's adapter.
+    # Init: A ortho, B zero → adapter is identity (zero delta) at step 0.
+    use_lora = bool(int(os.environ.get("USE_LORA", "0")))
+    lora_rank = int(os.environ.get("LORA_RANK", "16"))  # low-rank bottleneck dim
     # LARGE_GPU: disable laptop-GPU Inductor workarounds (persistent_reductions=False, max_fusion_size=64).
     # Set LARGE_GPU=1 when training on H100/A100/3090+ with ample registers.
     large_gpu = bool(int(os.environ.get("LARGE_GPU", "0")))
@@ -908,7 +921,7 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y = y.transpose(1, 2).reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -974,13 +987,42 @@ class BayesianMLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         pre = self.fc(x)
         if self.training:
-            sigma_fc = F.softplus(self.fc_log_sigma).to(pre.dtype)
-            pre = pre + torch.randn_like(pre) * sigma_fc
+            pre = pre + torch.randn_like(pre) * F.softplus(self.fc_log_sigma).to(pre.dtype)
         h = torch.relu(pre).square()
         out = self.proj(h)
         if self.training:
-            sigma_proj = F.softplus(self.proj_log_sigma).to(out.dtype)
-            out = out + torch.randn_like(out) * sigma_proj
+            out = out + torch.randn_like(out) * F.softplus(self.proj_log_sigma).to(out.dtype)
+        return out
+
+
+class BayesReLUSquareMLP(nn.Module):
+    """ReLU² MLP with Bayesian weight noise at train time (local reparameterization trick).
+
+    Identical to BayesianMLP in structure and noise injection, but explicitly named for use
+    in NoPE blocks when USE_SWIGLU=1, keeping each block type architecturally distinct.
+    NoPE blocks skip RoPE entirely — pairing them with a simpler activation (relu²) vs the
+    gate-heavy SwiGLU used in RoPE blocks gives each block type a complementary inductive bias.
+
+      pre ~ fc(x) + N(0, softplus(fc_log_sigma))        [train only]
+      out ~ proj(relu(pre)²) + N(0, softplus(proj_log_sigma))  [train only]
+    """
+
+    def __init__(self, dim: int, mlp_hidden: int, prior_log_sigma: float = -4.0):
+        super().__init__()
+        self.fc = CastedLinear(dim, mlp_hidden, bias=False)
+        self.proj = CastedLinear(mlp_hidden, dim, bias=False)
+        self.proj._zero_init = True
+        self.fc_log_sigma   = nn.Parameter(torch.full((mlp_hidden,), prior_log_sigma))
+        self.proj_log_sigma = nn.Parameter(torch.full((dim,), prior_log_sigma))
+
+    def forward(self, x: Tensor) -> Tensor:
+        pre = self.fc(x)
+        if self.training:
+            pre = pre + torch.randn_like(pre) * F.softplus(self.fc_log_sigma).to(pre.dtype)
+        h = torch.relu(pre).square()
+        out = self.proj(h)
+        if self.training:
+            out = out + torch.randn_like(out) * F.softplus(self.proj_log_sigma).to(out.dtype)
         return out
 
 
@@ -992,8 +1034,6 @@ class BayesianSwiGLUMLP(nn.Module):
       val_pre  ~ val_proj(x)  + N(0, softplus(val_log_sigma))
       out      = down_proj(silu(gate_pre) * val_pre)
 
-    At eval(): noise is skipped — forward is identical to plain SwiGLUMLP.
-    log_sigma params are 1-D tensors → auto-route to scalar_params (negligible bytes).
     """
 
     def __init__(self, dim: int, hidden: int, prior_log_sigma: float = -4.0):
@@ -1009,8 +1049,11 @@ class BayesianSwiGLUMLP(nn.Module):
         gate = self.gate_proj(x)
         val  = self.val_proj(x)
         if self.training:
-            gate = gate + torch.randn_like(gate) * F.softplus(self.gate_log_sigma).to(gate.dtype)
-            val  = val  + torch.randn_like(val)  * F.softplus(self.val_log_sigma).to(val.dtype)
+            # Compute both noise scales in one softplus pass, then apply.
+            sg = F.softplus(self.gate_log_sigma).to(gate.dtype)
+            sv = F.softplus(self.val_log_sigma).to(val.dtype)
+            gate = gate + torch.randn_like(gate) * sg
+            val  = val  + torch.randn_like(val)  * sv
         return self.down_proj(F.silu(gate) * val)
 
 
@@ -1053,16 +1096,49 @@ class BigramHashEmbedding(nn.Module):
     def bigram_hash(self, tokens: Tensor) -> Tensor:
         t = tokens.to(torch.int32)
         mod = self.bigram_vocab_size - 1
-        out = torch.empty_like(t)
-        out[..., 0] = mod  # position 0: no previous token → fallback bucket
-        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
-        return out.long()
+        # XOR hash of consecutive pairs for positions 1..
+        # F.pad + slice to avoid in-place index writes that break the Triton graph.
+        hashed = torch.bitwise_xor(36313 * t, 27191 * F.pad(t, (1, 0))[:, :-1]) % mod
+        # Position 0 has no predecessor; force it to the fallback bucket (mod).
+        fallback = torch.full_like(hashed[:, :1], mod)
+        return torch.cat([fallback, hashed[:, 1:]], dim=1).long()
 
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(self.bigram_hash(token_ids))
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
+
+
+class BwdLoRADelta(nn.Module):
+    """Backward-looking LoRA adapter with a learned switch gate.
+
+    Adds a low-rank correction to the MLP output using the PREVIOUS token's hidden state:
+        delta(x) = switch * B(A(x_prev))    where x_prev = shift_right(x, 1)
+
+    This gives each block a cheap 1-step recurrent path: the MLP output at position t
+    is also informed by the hidden state at position t-1, without self-attention cost.
+
+    Init: A is orthogonal (good gradient flow), B is zeros → delta=0 at step 0.
+    switch: learned scalar starting at 0 → adapter begins inactive, grows if useful.
+    Both A and B are (dim, rank) so they route to matrix_params → AdaMuon.
+    switch is a scalar → routes to scalar_params → Adam.
+    """
+
+    def __init__(self, dim: int, rank: int):
+        super().__init__()
+        self.A = nn.Linear(dim, rank, bias=False)   # down-project
+        self.B = nn.Linear(rank, dim, bias=False)   # up-project (zero-init)
+        self.B._zero_init = True
+        self.switch = nn.Parameter(torch.zeros((), dtype=torch.float32))  # scalar gate
+        # A: orthogonal init for stable gradient flow through the low-rank path
+        nn.init.orthogonal_(self.A.weight)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # F.pad + slice instead of cat to avoid a 'select' node in the Triton graph
+        # that fuses badly and causes graph breaks inside torch.compile.
+        x_prev = F.pad(x, (0, 0, 1, 0))[:, :-1, :]  # shift right 1, zero-pad left
+        return torch.tanh(self.switch) * self.B(self.A(x_prev))
 
 
 class Block(nn.Module):
@@ -1085,6 +1161,8 @@ class Block(nn.Module):
         swiglu_hidden: int = 0,
         ln_scale: bool = False,
         use_shared_v: bool = False,
+        use_lora: bool = False,
+        lora_rank: int = 16,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1092,8 +1170,12 @@ class Block(nn.Module):
         # All blocks use standard GQA (CausalSelfAttention); attn_every/block_idx kept for API compat
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, nope_heads=nope_heads, use_alibi=use_alibi, use_shared_v=use_shared_v)
         _swiglu_h = swiglu_hidden if swiglu_hidden > 0 else max(1, round(mlp_hidden * 2 / 3))
+        _is_nope_block = (nope_heads == num_heads)  # fully NoPE block → use ReLU² MLP
         if use_bayes_mlp and use_swiglu:
-            self.mlp = BayesianSwiGLUMLP(dim, _swiglu_h, prior_log_sigma)
+            if _is_nope_block:
+                self.mlp = BayesReLUSquareMLP(dim, mlp_hidden, prior_log_sigma)
+            else:
+                self.mlp = BayesianSwiGLUMLP(dim, _swiglu_h, prior_log_sigma)
         elif use_bayes_mlp:
             self.mlp = BayesianMLP(dim, mlp_hidden, prior_log_sigma)
         elif use_swiglu:
@@ -1103,16 +1185,22 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.lora: BwdLoRADelta | None = BwdLoRADelta(dim, lora_rank) if use_lora else None
         # LN_SCALE: dampen normed activations by 1/sqrt(depth) to stabilize deep layers
         self.ln_scale_factor = 1.0 / math.sqrt(block_idx + 1) if ln_scale else 1.0
 
     def forward(self, x: Tensor, x0: Tensor, shared_v_proj: "CastedLinear | None" = None) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
+        # Cast all float32 scale params once to match x.dtype (bfloat16 at train time).
+        dt = x.dtype
+        mix = self.resid_mix.to(dtype=dt)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         s = self.ln_scale_factor
         attn_out = self.attn(self.attn_norm(x) * s, shared_v_proj=shared_v_proj)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
+        x = x + self.attn_scale.to(dtype=dt)[None, None, :] * attn_out
+        mlp_out = self.mlp_scale.to(dtype=dt)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
+        if self.lora is not None:
+            mlp_out = mlp_out + self.lora(x)
+        x = x + mlp_out
         return x
 
 
@@ -1131,7 +1219,9 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         attn_every: int = 2,
-        nope_heads: int = 0,
+        nope_heads: int = 0,       # used when nope_mode="head"
+        nope_ratio: float = 0.0,   # used when nope_mode="block"
+        nope_mode: str = "head",   # "head" | "block"
         use_bayes_mlp: bool = False,
         bayes_prior_log_sigma: float = -4.0,
         share_weights: bool = False,
@@ -1148,6 +1238,10 @@ class GPT(nn.Module):
         bigram_buckets: int = 2048,
         bigram_dim: int = 128,
         use_shared_value_emb: bool = False,
+        label_smoothing: float = 0.0,
+        focal_gamma: float = 0.0,
+        use_lora: bool = False,
+        lora_rank: int = 16,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1155,6 +1249,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.label_smoothing = label_smoothing
+        self.focal_gamma = focal_gamma
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.smear = SmearGate(model_dim)
         # BigramHashEmbedding: bigram context added to tok_emb before RMSNorm.
@@ -1182,13 +1278,22 @@ class GPT(nn.Module):
         # When sharing, only num_encoder_layers unique blocks are created.
         # The decoder mirrors them in reverse (block i ↔ block N-1-i).
         num_unique_blocks = self.num_encoder_layers if share_weights else num_layers
+        # Per-block NoPE: every round(1/nope_ratio)-th block is fully NoPE; rest fully RoPE.
+        # Head NoPE: every block gets the same nope_heads split (legacy).
+        _nope_period = max(1, round(1.0 / nope_ratio)) if (nope_mode == "block" and nope_ratio > 0) else 0
+        def _block_nope(i: int) -> int:
+            if use_alibi:
+                return 0
+            if _nope_period > 0:
+                return num_heads if (i % _nope_period == 0) else 0
+            return nope_heads
         self.blocks = nn.ModuleList(
             [
                 Block(
                     model_dim, num_heads, num_kv_heads, mlp_hidden,
                     rope_base, qk_gain_init,
                     block_idx=i, attn_every=attn_every,
-                    nope_heads=0 if use_alibi else nope_heads,
+                    nope_heads=_block_nope(i),
                     use_bayes_mlp=use_bayes_mlp,
                     prior_log_sigma=bayes_prior_log_sigma,
                     use_alibi=use_alibi,
@@ -1196,6 +1301,8 @@ class GPT(nn.Module):
                     swiglu_hidden=swiglu_hidden,
                     ln_scale=ln_scale,
                     use_shared_v=use_shared_value_emb,
+                    use_lora=use_lora,
+                    lora_rank=lora_rank,
                 )
                 for i in range(num_unique_blocks)
             ]
@@ -1213,9 +1320,19 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+        num_layers = len(self.blocks)
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                if getattr(module, "_zero_init", False):
+                    nn.init.zeros_(module.weight)
+                elif module.weight.ndim == 2 and "lora" not in name:
+                    # Orthogonal init for all non-LoRA, non-zero-init weight matrices.
+                    # Output projections (proj/down_proj) get 1/√(2L) scaling to keep
+                    # residual stream variance stable at init across depth.
+                    nn.init.orthogonal_(module.weight)
+                    if any(s in name for s in (".proj", "down_proj", ".c_o")):
+                        with torch.no_grad():
+                            module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
     def _run_blocks(self, x: Tensor) -> Tensor:
         svp = self.shared_v_proj  # None or a shared CastedLinear for V projection
@@ -1252,7 +1369,15 @@ class GPT(nn.Module):
         targets = target_ids.reshape(-1)
         logits_proj = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        if self.focal_gamma > 0.0:
+            # Focal loss: scale each token's CE by (1 - p_t)^gamma.
+            # p_t is the model's probability on the correct token.
+            with torch.no_grad():
+                log_pt = -F.cross_entropy(logits.float(), targets, reduction="none", label_smoothing=self.label_smoothing)
+                focal_weight = (1.0 - log_pt.exp()).pow(self.focal_gamma)
+            per_token_ce = F.cross_entropy(logits.float(), targets, reduction="none", label_smoothing=self.label_smoothing)
+            return (focal_weight * per_token_ce).mean()
+        return F.cross_entropy(logits.float(), targets, reduction="mean", label_smoothing=self.label_smoothing)
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits [bsz, seq_len, vocab] without loss (for sliding-window eval)."""
@@ -1352,14 +1477,19 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
-    # NoPE: snap to GQA-group boundary so KV-head split is always clean
+    # NoPE: snap to GQA-group boundary so KV-head split is always clean (head mode only)
     _gqa_ratio = max(1, args.num_heads // args.num_kv_heads)
     nope_heads = (int(round(args.nope_ratio * args.num_heads)) // _gqa_ratio) * _gqa_ratio
     nope_heads = max(0, min(nope_heads, args.num_heads))
-    log0(
-        f"nope:nope_ratio={args.nope_ratio} nope_heads={nope_heads}/{args.num_heads} "
-        f"rope_heads={args.num_heads - nope_heads}/{args.num_heads}"
-    )
+    if args.nope_mode == "block" and args.nope_ratio > 0:
+        _nope_period = max(1, round(1.0 / args.nope_ratio))
+        _nope_blocks = [i for i in range(args.num_layers) if i % _nope_period == 0]
+        log0(f"nope:mode=block nope_ratio={args.nope_ratio} period={_nope_period} nope_blocks={_nope_blocks}")
+    else:
+        log0(
+            f"nope:mode=head nope_ratio={args.nope_ratio} "
+            f"nope_heads={nope_heads}/{args.num_heads} rope_heads={args.num_heads - nope_heads}/{args.num_heads}"
+        )
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1374,6 +1504,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         attn_every=args.attn_every,
         nope_heads=nope_heads,
+        nope_ratio=args.nope_ratio,
+        nope_mode=args.nope_mode,
         use_bayes_mlp=args.use_bayes_mlp,
         bayes_prior_log_sigma=args.bayes_prior_log_sigma,
         share_weights=args.share_weights,
@@ -1390,11 +1522,21 @@ def main() -> None:
         bigram_buckets=args.bigram_buckets,
         bigram_dim=args.bigram_dim,
         use_shared_value_emb=args.use_shared_value_emb,
+        label_smoothing=args.label_smoothing,
+        focal_gamma=args.focal_gamma,
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # Pre-populate Rotary cos/sin caches before torch.compile so the first trace
+    # sees the stable cache-hit path — avoids a retrace between steps 0 and 1.
+    with torch.no_grad():
+        for module in base_model.modules():
+            if isinstance(module, Rotary):
+                module(args.train_seq_len, device, torch.bfloat16)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1500,9 +1642,9 @@ def main() -> None:
     log0(f"pos_encoding:{'alibi' if args.use_alibi else ('rope+nope' if nope_heads > 0 else 'rope')}")
     _swiglu_h = args.swiglu_hidden if args.swiglu_hidden > 0 else max(1, round(args.mlp_hidden * 2 // 3))
     _mlp_variant = (
-        "BayesianSwiGLU" if (args.use_bayes_mlp and args.use_swiglu) else
-        "BayesianMLP"    if args.use_bayes_mlp else
-        "SwiGLU"         if args.use_swiglu else
+        "BayesSwiGLU(RoPE)+BayesReLU²(NoPE)" if (args.use_bayes_mlp and args.use_swiglu) else
+        "BayesianMLP"                         if args.use_bayes_mlp else
+        "SwiGLU"                              if args.use_swiglu else
         "ReLU²"
     )
     _mlp_detail = (
@@ -1542,15 +1684,18 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        warmup_scale = min(step / args.lr_warmup_steps, 1.0) if args.lr_warmup_steps > 0 else 1.0
         if args.warmdown_iters <= 0:
-            return 1.0
+            return warmup_scale
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            decay = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            return warmup_scale * decay
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        decay = remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        return warmup_scale * decay
 
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}

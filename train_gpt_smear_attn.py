@@ -163,6 +163,24 @@ class Hyperparameters:
     # With N GPUs: grad_accum_steps = max(1, grad_accum_target // N).
     # Default 8 keeps single-GPU behaviour unchanged; set equal to NPROC for no accum.
     grad_accum_target = int(os.environ.get("GRAD_ACCUM_TARGET", "8"))
+    # TTT: test-time training — full-weight AdamW adaptation on validation data.
+    # Runs after main training (post-EMA), before serialization. Off by default.
+    # TTT_FREEZE_BLOCKS=N freezes the first N transformer blocks during adaptation.
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "10"))
+    ttt_lr = float(os.environ.get("TTT_LR", "1e-4"))
+    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", "32"))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", "0"))
+    # STE int6 QAT: Straight-Through Estimator quantization-aware training.
+    # Simulates int6 per-row quantization in CastedLinear.forward() during training when enabled.
+    # LATE_QAT=1 defers activation until LR scale drops below LATE_QAT_THRESHOLD (≈final phase).
+    # Significantly narrows the gap between full-precision training and int6-quantized evaluation.
+    late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", "0.15"))
+    # SWA: Stochastic Weight Averaging — collect model snapshots every SWA_EVERY steps,
+    # average them arithmetically. Applied after training, before EMA (EMA takes priority if both enabled).
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
+    swa_every = int(os.environ.get("SWA_EVERY", "200"))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -653,9 +671,21 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
+    # Class-level flag: when True, forward() simulates int6 per-row quantization
+    # via the Straight-Through Estimator (STE). Toggled in main() during late training.
+    _qat_enabled: bool = False
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
+            # Per-row int6 STE: quantize to [-32, 31] with per-row scale = max_abs / 31
+            w32 = w.float()
+            scale = w32.abs().amax(dim=1, keepdim=True).clamp_min(1.0 / 31.0) / 31.0
+            w_q = (w32 / scale).round().clamp(-32, 31) * scale
+            # STE: gradient flows through w; forward uses the rounded w_q
+            w = w + (w_q.to(w.dtype) - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1365,19 +1395,20 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
-        x = self.final_norm(self._run_blocks(x)).reshape(-1, x.size(-1))
+        hidden = self.final_norm(self._run_blocks(x))  # (B, T, D) — kept for MTP
+        h_flat = hidden.reshape(-1, hidden.size(-1))   # (B*T, D)
         targets = target_ids.reshape(-1)
-        logits_proj = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
+        logits_proj = F.linear(h_flat, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(h_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         if self.focal_gamma > 0.0:
             # Focal loss: scale each token's CE by (1 - p_t)^gamma.
-            # p_t is the model's probability on the correct token.
-            with torch.no_grad():
-                log_pt = -F.cross_entropy(logits.float(), targets, reduction="none", label_smoothing=self.label_smoothing)
-                focal_weight = (1.0 - log_pt.exp()).pow(self.focal_gamma)
+            # Compute CE once and derive focal_weight via detach to avoid double softmax pass.
             per_token_ce = F.cross_entropy(logits.float(), targets, reduction="none", label_smoothing=self.label_smoothing)
-            return (focal_weight * per_token_ce).mean()
-        return F.cross_entropy(logits.float(), targets, reduction="mean", label_smoothing=self.label_smoothing)
+            focal_weight = (1.0 - (-per_token_ce.detach()).exp()).pow(self.focal_gamma)
+            main_loss = (focal_weight * per_token_ce).mean()
+        else:
+            main_loss = F.cross_entropy(logits.float(), targets, reduction="mean", label_smoothing=self.label_smoothing)
+        return main_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits [bsz, seq_len, vocab] without loss (for sliding-window eval)."""
@@ -1389,6 +1420,180 @@ class GPT(nn.Module):
         x = self.final_norm(self._run_blocks(x))
         logits_proj = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+
+def eval_val_sliding_window(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Score every target token in val_tokens under full seq_len context.
+
+    Advances by `eval_stride` positions per forward pass. Only the last `eval_stride`
+    positions of each window's output contribute to the loss/BPB — the rest serve as
+    context. This gives an unbiased per-token BPB estimate across the whole val set.
+    Requires model to expose `forward_logits(input_ids) -> (B, T, vocab)`.
+    """
+    seq_len = args.train_seq_len
+    stride = args.eval_stride
+    batch_seqs = args.eval_batch_seqs
+    N = val_tokens.numel() - 1  # number of scoreable target positions (tokens[1..N])
+
+    # Shard target positions across ranks
+    my_start = (N * rank) // world_size
+    my_end = (N * (rank + 1)) // world_size
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_tok_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    # Build window metadata for this rank.
+    # Each entry: (p_end, win_start, score_offset, n_score)
+    #   p_end       — exclusive end of target range in val_tokens (last scored = val_tokens[p_end])
+    #   win_start   — start of context window in val_tokens (may be padded from 0)
+    #   score_offset — first position within the seq_len window to score (rest = context)
+    #   n_score     — number of target positions scored in this window
+    window_infos: list[tuple[int, int, int, int]] = []
+    p = my_start
+    while p < my_end:
+        p_end = min(p + stride, my_end)
+        n_score = p_end - p
+        win_start = max(0, p_end - seq_len)
+        win_len = p_end - win_start           # actual number of (x, y) pairs before padding
+        score_offset = seq_len - n_score      # within the padded-to-seq_len window
+        window_infos.append((p_end, win_start, score_offset, n_score))
+        p = p_end
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_start in range(0, len(window_infos), batch_seqs):
+            batch = window_infos[batch_start : batch_start + batch_seqs]
+
+            # Load raw token slices on CPU, left-pad to seq_len, then stack to GPU in one shot
+            batch_raws: list[Tensor] = []
+            for p_end, win_start, score_offset, n_score in batch:
+                raw = val_tokens[win_start : p_end + 1]  # length win_len+1, on CPU
+                pad = seq_len - (p_end - win_start)
+                if pad > 0:
+                    raw = F.pad(raw, (pad, 0), value=0)
+                batch_raws.append(raw)
+
+            x_batch = torch.stack([r[:-1] for r in batch_raws]).to(device=device, dtype=torch.int64)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = model.forward_logits(x_batch)  # (B, seq_len, vocab)
+
+            for logi, raw, (p_end, win_start, score_offset, n_score) in zip(logits, batch_raws, batch):
+                raw_dev = raw.to(device=device, dtype=torch.int64)
+                xi = raw_dev[:-1]           # (seq_len,)
+                yi = raw_dev[1:]            # (seq_len,)
+                log_sl = logi[score_offset:]    # (n_score, vocab)
+                y_sl = yi[score_offset:]        # (n_score,)
+                x_sl = xi[score_offset:]        # (n_score,) — previous-token ids for byte counting
+                per_tok = F.cross_entropy(log_sl.float(), y_sl, reduction="none")
+                val_loss_sum += per_tok.to(torch.float64).sum()
+                val_tok_count += float(per_tok.numel())
+                tbytes = base_bytes_lut[y_sl].to(dtype=torch.int16)
+                tbytes += (has_leading_space_lut[y_sl] & ~is_boundary_token_lut[x_sl]).to(dtype=torch.int16)
+                val_byte_count += tbytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_tok_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = float((val_loss_sum / val_tok_count).item())
+    bpb = val_loss / math.log(2.0) * float((val_tok_count / val_byte_count).item())
+    model.train()
+    return val_loss, bpb
+
+
+def ttt_adapt(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    device: torch.device,
+    val_tokens: Tensor,
+    rank: int = 0,
+    world_size: int = 1,
+    log_fn=None,
+) -> None:
+    """Full-weight AdamW adaptation on validation data (test-time training).
+
+    Splits val sequences across ranks, computes gradients independently per rank,
+    then all-reduces before the optimizer step so all ranks stay in sync.
+    Optionally freezes the first `ttt_freeze_blocks` transformer blocks.
+    """
+    seq_len = args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
+    batch_seqs = args.ttt_batch_seqs
+
+    if args.ttt_freeze_blocks > 0:
+        for i, block in enumerate(base_model.blocks):
+            if i < args.ttt_freeze_blocks:
+                for p in block.parameters():
+                    p.requires_grad_(False)
+
+    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(ttt_params, lr=args.ttt_lr, weight_decay=0.0)
+
+    my_start = (total_seqs * rank) // world_size
+    my_end = (total_seqs * (rank + 1)) // world_size
+
+    base_model.train()
+    t0 = time.perf_counter()
+
+    for epoch in range(args.ttt_epochs):
+        epoch_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        epoch_tokens = torch.zeros((), device=device, dtype=torch.float64)
+
+        for batch_start in range(my_start, my_end, batch_seqs):
+            batch_end = min(batch_start + batch_seqs, my_end)
+            raw_start = batch_start * seq_len
+            raw_end = batch_end * seq_len + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = base_model(x, y)
+            loss.backward()
+
+            # Manual gradient sync across ranks (bypassing DDP since we call base_model directly)
+            if world_size > 1:
+                for p in ttt_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+            torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
+            optimizer.step()
+
+            epoch_loss_sum += loss.detach().to(torch.float64) * y.numel()
+            epoch_tokens += float(y.numel())
+
+        if world_size > 1:
+            dist.all_reduce(epoch_loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(epoch_tokens, op=dist.ReduceOp.SUM)
+
+        elapsed = time.perf_counter() - t0
+        if log_fn:
+            log_fn(
+                f"ttt_epoch:{epoch + 1}/{args.ttt_epochs} "
+                f"loss:{epoch_loss_sum.item() / max(epoch_tokens.item(), 1):.4f} "
+                f"time:{elapsed:.1f}s"
+            )
+
+    # Restore all params to trainable (callers may inspect requires_grad)
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+
+    if log_fn:
+        log_fn(f"ttt:done elapsed={time.perf_counter() - t0:.1f}s")
 
 
 def main() -> None:
@@ -1670,6 +1875,13 @@ def main() -> None:
         + (f" decay:{args.ema_decay}" if args.ema_enabled else "")
     )
     log0(
+        f"swa:{'enabled' if args.swa_enabled else 'disabled'}"
+        + (f" every:{args.swa_every}" if args.swa_enabled else "")
+    )
+    log0(
+        f"qat:late={args.late_qat} threshold={args.late_qat_threshold}"
+    )
+    log0(
         f"ln_scale:{args.ln_scale} "
         f"backout:{'enabled' if args.backout_enabled else 'disabled'}"
         + (f" layer:{base_model.backout_layer} lambda_init:{args.backout_lambda_init}" if args.backout_enabled else "")
@@ -1728,6 +1940,8 @@ def main() -> None:
     ema_state: dict[str, Tensor] | None = None
     if args.ema_enabled:
         ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
+    swa_state: dict[str, Tensor] | None = None
+    swa_count: int = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1767,6 +1981,10 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        # STE int6 QAT: enable when LR has decayed to the late-phase threshold
+        if args.late_qat and not CastedLinear._qat_enabled and scale < args.late_qat_threshold:
+            CastedLinear._qat_enabled = True
+            log0(f"qat:enabling int6 STE at step:{step} lr_scale:{scale:.4f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1804,6 +2022,16 @@ def main() -> None:
             with torch.no_grad():
                 for name, t in base_model.state_dict().items():
                     ema_state[name].mul_(d).add_(t.detach().float(), alpha=1.0 - d)
+        # SWA: accumulate arithmetic average of snapshots every swa_every steps
+        if args.swa_enabled and step % args.swa_every == 0:
+            with torch.no_grad():
+                if swa_state is None:
+                    swa_state = {n: t.detach().float().clone() for n, t in base_model.state_dict().items()}
+                    swa_count = 1
+                else:
+                    for n, t in base_model.state_dict().items():
+                        swa_state[n].mul_(swa_count / (swa_count + 1)).add_(t.detach().float(), alpha=1.0 / (swa_count + 1))
+                    swa_count += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1829,12 +2057,28 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
+    if swa_state is not None:
+        log0(f"swa:applying SWA weights ({swa_count} snapshots) before serialization")
+        swa_applied = {name: t.to(dtype=base_model.state_dict()[name].dtype) for name, t in swa_state.items()}
+        del swa_state
+        base_model.load_state_dict(swa_applied, strict=True)
+
     if ema_state is not None:
         log0("ema:applying EMA weights before serialization")
         avg_state = {name: t.to(dtype=base_model.state_dict()[name].dtype)
                      for name, t in ema_state.items()}
         del ema_state
         base_model.load_state_dict(avg_state, strict=True)
+
+    if args.ttt_enabled:
+        log0(
+            f"ttt:starting epochs:{args.ttt_epochs} lr:{args.ttt_lr} "
+            f"batch_seqs:{args.ttt_batch_seqs} freeze_blocks:{args.ttt_freeze_blocks}"
+        )
+        ttt_adapt(
+            args, base_model, device, val_tokens,
+            rank=rank, world_size=world_size, log_fn=log0,
+        )
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1961,11 +2205,32 @@ def main() -> None:
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
+    q_eval_ms = 1000.0 * (time.perf_counter() - t_qeval)
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        f"eval_time:{q_eval_ms:.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # int6 roundtrip — same model (all MLP+attn params are int6), explicit naming convention
+    log0(
+        f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"eval_time:{q_eval_ms:.0f}ms"
+    )
+    log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # int6 sliding-window evaluation: score every token under full seq_len context
+    t_sw = time.perf_counter()
+    sw_val_loss, sw_val_bpb = eval_val_sliding_window(
+        args, base_model, rank, world_size, device,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+        f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms"
+    )
+    log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()

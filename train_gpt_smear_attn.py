@@ -181,6 +181,11 @@ class Hyperparameters:
     # average them arithmetically. Applied after training, before EMA (EMA takes priority if both enabled).
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     swa_every = int(os.environ.get("SWA_EVERY", "200"))
+    # XSA: Exclusive Self Attention — last xsa_layers blocks use full MHA (num_kv_heads=num_heads).
+    # Gives each query head its own exclusive K/V pair in the final layers for maximum expressivity.
+    # Shared-V is automatically disabled for XSA blocks (their V dim differs from the shared proj).
+    use_xsa = bool(int(os.environ.get("USE_XSA", "0")))
+    xsa_layers = int(os.environ.get("XSA_LAYERS", "4"))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -909,6 +914,18 @@ class CausalSelfAttention(nn.Module):
         else:
             self.alibi = None
             self.rotary = Rotary(self.head_dim, base=rope_base) if self.rope_heads > 0 else None
+        self.use_xsa = False  # set to True by GPT.__init__ for the last xsa_layers blocks
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        """XSA post-processing: subtract the self-value projection from each head's output.
+        y: [B, T, H, D], v: [B, T, Hkv, D]. H must be divisible by Hkv."""
+        B, T, H, D = y.shape
+        Hkv = v.size(-2)
+        group = H // Hkv
+        y_g = y.reshape(B, T, Hkv, group, D)        # [B, T, Hkv, group, D]
+        vn = F.normalize(v, dim=-1).unsqueeze(-2)    # [B, T, Hkv, 1, D] — broadcast ready
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, T, H, D)
 
     def forward(self, x: Tensor, shared_v_proj: "CastedLinear | None" = None) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -951,7 +968,10 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
-        y = y.transpose(1, 2).reshape(bsz, seqlen, dim)
+        y = y.transpose(1, 2)  # (B, T, H, D)
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v.transpose(1, 2))
+        y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -1272,6 +1292,8 @@ class GPT(nn.Module):
         focal_gamma: float = 0.0,
         use_lora: bool = False,
         lora_rank: int = 16,
+        use_xsa: bool = False,
+        xsa_layers: int = 4,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1337,6 +1359,10 @@ class GPT(nn.Module):
                 for i in range(num_unique_blocks)
             ]
         )
+        # XSA: flag the last xsa_layers blocks for exclusive self-attention post-processing
+        if use_xsa:
+            for blk in list(self.blocks)[-xsa_layers:]:
+                blk.attn.use_xsa = True
         self.attnres: AttnRes | None = (
             AttnRes(model_dim, len(self.blocks), self._attnres_block_size)
             if self._use_attnres else None
@@ -1731,6 +1757,8 @@ def main() -> None:
         focal_gamma=args.focal_gamma,
         use_lora=args.use_lora,
         lora_rank=args.lora_rank,
+        use_xsa=args.use_xsa,
+        xsa_layers=args.xsa_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):

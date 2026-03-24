@@ -23,7 +23,7 @@ VAL_LOSS_EVERY=0 VAL_BATCH_SIZE=786432 \
 TRAIN_LOG_EVERY=250 \
 QUANT_AUTO_BUDGET_MB=0 MAX_WALLCLOCK_SECONDS=600 \
 LARGE_GPU="${LARGE_GPU}" \
-EMA_ENABLED=0 EMA_DECAY=0.999 \
+EMA_ENABLED=1 EMA_DECAY=0.995 \
 LN_SCALE=1 \
 BACKOUT_ENABLED=1 BACKOUT_LAMBDA_INIT=0.12 BACKOUT_LAYER=-1 \
 USE_ADAMUON=1 ADAMUON_BETA2=0.92 \
@@ -31,10 +31,11 @@ USE_ATTNRES=0 \
 ATTNRES_BLOCK_SIZE=4 \
 USE_BIGRAM=1 BIGRAM_BUCKETS=2048 BIGRAM_DIM=128 \
 USE_SHARED_VALUE_EMB=1 \
+TIE_EMBEDDINGS=1 LOGIT_SOFTCAP=30.0 \
 USE_LORA=1 LORA_RANK=16 \
 GRAD_CLIP_NORM=0.1 \
 FOCAL_GAMMA=0.6 \
-TTT_ENABLED=1 \
+TTT_ENABLED=0 \
 TTT_EPOCHS=10 \
 TTT_LR=1e-4 \
 TTT_BATCH_SEQS=32 \
@@ -42,23 +43,5 @@ TTT_FREEZE_BLOCKS=0 \
 LATE_QAT=1 \
 LATE_QAT_THRESHOLD=0.15 \
 SWA_ENABLED=1 \
-SWA_EVERY=200 \
+SWA_EVERY=50 \
 "${LAUNCHER[@]}" train_gpt_smear_attn.py 
-
-
-\
-`# ── Multi-Token Prediction (MTP) ─────────────────────────────────────────────` \
-`# Adds N auxiliary heads that predict k+1..k+N future tokens from the same`    \
-`# hidden state. Acts as a regularizer; heads are excluded from the checkpoint.` \
-
-\
-`# ── STE int6 Quantization-Aware Training (QAT) ───────────────────────────────` \
-`# Applies a per-row int6 Straight-Through Estimator to all CastedLinear weights`\
-`# once the LR cosine scale drops below LATE_QAT_THRESHOLD, bridging the`        \
-`# train/eval quantization gap in the final phase of training.`                  \
-
-\
-`# ── Stochastic Weight Averaging (SWA) ────────────────────────────────────────`\
-`# Accumulates a running average of model snapshots every SWA_EVERY steps and`   \
-`# replaces the weights with the average before final eval/quantization.`        \
-`# Usually lowers val BPB by ~0.001-0.003 at no extra training cost.`           \

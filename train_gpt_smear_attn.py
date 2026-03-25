@@ -113,9 +113,17 @@ class Hyperparameters:
     # Override with SWIGLU_HIDDEN to set explicitly.
     use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
     swiglu_hidden = int(os.environ.get("SWIGLU_HIDDEN", "0"))  # 0 = auto (2/3 * mlp_hidden)
+    # PowerMLP SwiGLU: replaces BayesianSwiGLUMLP (or SwiGLUMLP) with a PowerMLP-style gate.
+    # Gate activation = relu(gate)^n + silu(gate) — no extra parameters vs SwiGLUMLP.
+    # USE_POWER_MLP_SWIGLU=1 requires USE_SWIGLU=1. NoPE blocks are unaffected.
+    use_power_mlp_swiglu = bool(int(os.environ.get("USE_POWER_MLP_SWIGLU", "0")))
+    power_mlp_repu_order = int(os.environ.get("POWER_MLP_REPU_ORDER", "2"))
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))   # stride=64 → dense full-context scoring
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    # SKIP_SLIDING_EVAL=1: skip the final sliding-window eval entirely (useful for dev/smoke runs).
+    # On a single small GPU with a 62M-token val set, the default stride=64 eval takes 30+ minutes.
+    skip_sliding_eval = bool(int(os.environ.get("SKIP_SLIDING_EVAL", "0")))
     # AdaMuon: drop-in replacement for Muon that adds Adam-style adaptive second moment
     # on the *orthogonalized* direction before RMS-aligned rescaling (Algorithm 1).
     # Set USE_ADAMUON=1 to replace Muon with AdaMuon for matrix params.
@@ -1107,6 +1115,37 @@ class BayesianSwiGLUMLP(nn.Module):
         return self.down_proj(F.silu(gate) * val)
 
 
+class PowerMLPSwiGLU(nn.Module):
+    """SwiGLU FFN with a PowerMLP-style gate activation (iso-parametric with SwiGLUMLP).
+
+    Replaces the standard SiLU gate with a combined RePU + SiLU activation on the
+    same gate pre-activation — the PowerMLP "ResRePUBlock" pattern without an extra matrix:
+
+      gate     = gate_proj(x)
+      gate_act = relu(gate)^repu_order + silu(gate)   # RePU + SiLU residual on same logit
+      out      = down_proj(gate_act * val_proj(x))
+
+    USE_POWER_MLP_SWIGLU=1 (with USE_SWIGLU=1) selects this for RoPE blocks instead of
+    BayesianSwiGLUMLP. NoPE blocks keep their BayesReLUSquareMLP / MLP assignment.
+    POWER_MLP_REPU_ORDER sets the polynomial order (default 2 = ReLU²).
+    Zero extra parameters vs SwiGLUMLP — same three matrices.
+    """
+
+    def __init__(self, dim: int, hidden: int, repu_order: int = 2):
+        super().__init__()
+        self.gate_proj = CastedLinear(dim, hidden, bias=False)
+        self.val_proj  = CastedLinear(dim, hidden, bias=False)
+        self.down_proj = CastedLinear(hidden, dim, bias=False)
+        self.down_proj._zero_init = True
+        self.repu_order = repu_order
+
+    def forward(self, x: Tensor) -> Tensor:
+        gate = self.gate_proj(x)
+        # relu^n is the PowerMLP RePU; silu(gate) is the ResSiLU residual — same pre-activation.
+        gate_act = F.relu(gate).pow(self.repu_order) + F.silu(gate)
+        return self.down_proj(gate_act * self.val_proj(x))
+
+
 class SmearGate(nn.Module):
     """Blend each token's hidden state with the previous token's hidden state.
     A per-dim learned gate (init=0 → identity at start) controls the blend.
@@ -1213,6 +1252,8 @@ class Block(nn.Module):
         use_shared_v: bool = False,
         use_lora: bool = False,
         lora_rank: int = 16,
+        use_power_mlp_swiglu: bool = False,
+        power_mlp_repu_order: int = 2,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1221,7 +1262,14 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, nope_heads=nope_heads, use_alibi=use_alibi, use_shared_v=use_shared_v)
         _swiglu_h = swiglu_hidden if swiglu_hidden > 0 else max(1, round(mlp_hidden * 2 / 3))
         _is_nope_block = (nope_heads == num_heads)  # fully NoPE block → use ReLU² MLP
-        if use_bayes_mlp and use_swiglu:
+        if use_power_mlp_swiglu and use_swiglu:
+            # PowerMLP SwiGLU: all blocks use it unless use_bayes_mlp=1, in which case
+            # NoPE blocks keep BayesReLUSquareMLP for architectural diversity.
+            if _is_nope_block and use_bayes_mlp:
+                self.mlp = BayesReLUSquareMLP(dim, mlp_hidden, prior_log_sigma)
+            else:
+                self.mlp = PowerMLPSwiGLU(dim, _swiglu_h, power_mlp_repu_order)
+        elif use_bayes_mlp and use_swiglu:
             if _is_nope_block:
                 self.mlp = BayesReLUSquareMLP(dim, mlp_hidden, prior_log_sigma)
             else:
@@ -1278,6 +1326,8 @@ class GPT(nn.Module):
         use_alibi: bool = False,
         use_swiglu: bool = False,
         swiglu_hidden: int = 0,
+        use_power_mlp_swiglu: bool = False,
+        power_mlp_repu_order: int = 2,
         ln_scale: bool = False,
         backout_enabled: bool = False,
         backout_lambda_init: float = 0.2,
@@ -1355,6 +1405,8 @@ class GPT(nn.Module):
                     use_shared_v=use_shared_value_emb,
                     use_lora=use_lora,
                     lora_rank=lora_rank,
+                    use_power_mlp_swiglu=use_power_mlp_swiglu,
+                    power_mlp_repu_order=power_mlp_repu_order,
                 )
                 for i in range(num_unique_blocks)
             ]
@@ -1743,6 +1795,8 @@ def main() -> None:
         use_alibi=args.use_alibi,
         use_swiglu=args.use_swiglu,
         swiglu_hidden=args.swiglu_hidden,
+        use_power_mlp_swiglu=args.use_power_mlp_swiglu,
+        power_mlp_repu_order=args.power_mlp_repu_order,
         ln_scale=args.ln_scale,
         backout_enabled=args.backout_enabled,
         backout_lambda_init=args.backout_lambda_init,
@@ -1875,13 +1929,16 @@ def main() -> None:
     log0(f"pos_encoding:{'alibi' if args.use_alibi else ('rope+nope' if nope_heads > 0 else 'rope')}")
     _swiglu_h = args.swiglu_hidden if args.swiglu_hidden > 0 else max(1, round(args.mlp_hidden * 2 // 3))
     _mlp_variant = (
-        "BayesSwiGLU(RoPE)+BayesReLU²(NoPE)" if (args.use_bayes_mlp and args.use_swiglu) else
-        "BayesianMLP"                         if args.use_bayes_mlp else
-        "SwiGLU"                              if args.use_swiglu else
+        "PowerMLPSwiGLU(all)+BayesReLU²(NoPE)" if (args.use_power_mlp_swiglu and args.use_swiglu and args.use_bayes_mlp) else
+        "PowerMLPSwiGLU(all)"                  if (args.use_power_mlp_swiglu and args.use_swiglu) else
+        "BayesSwiGLU(RoPE)+BayesReLU²(NoPE)"  if (args.use_bayes_mlp and args.use_swiglu) else
+        "BayesianMLP"                          if args.use_bayes_mlp else
+        "SwiGLU"                               if args.use_swiglu else
         "ReLU²"
     )
     _mlp_detail = (
-        f"swiglu_hidden:{_swiglu_h} bayes_prior_log_sigma:{args.bayes_prior_log_sigma}" if (args.use_bayes_mlp and args.use_swiglu) else
+        f"swiglu_hidden:{_swiglu_h} repu_order:{args.power_mlp_repu_order}"              if (args.use_power_mlp_swiglu and args.use_swiglu) else
+        f"swiglu_hidden:{_swiglu_h} bayes_prior_log_sigma:{args.bayes_prior_log_sigma}"  if (args.use_bayes_mlp and args.use_swiglu) else
         f"bayes_prior_log_sigma:{args.bayes_prior_log_sigma}"                            if args.use_bayes_mlp else
         f"swiglu_hidden:{_swiglu_h}"                                                     if args.use_swiglu else
         f"mlp_hidden:{args.mlp_hidden}"
@@ -2248,17 +2305,20 @@ def main() -> None:
     log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     # int6 sliding-window evaluation: score every token under full seq_len context
-    t_sw = time.perf_counter()
-    sw_val_loss, sw_val_bpb = eval_val_sliding_window(
-        args, base_model, rank, world_size, device,
-        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
-        f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms"
-    )
-    log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+    if args.skip_sliding_eval:
+        log0("final_int6_sliding_window:skipped (SKIP_SLIDING_EVAL=1)")
+    else:
+        t_sw = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val_sliding_window(
+            args, base_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms"
+        )
+        log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()

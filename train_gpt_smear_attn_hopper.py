@@ -114,6 +114,11 @@ class Hyperparameters:
     # Override with SWIGLU_HIDDEN to set explicitly.
     use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
     swiglu_hidden = int(os.environ.get("SWIGLU_HIDDEN", "0"))  # 0 = auto (2/3 * mlp_hidden)
+    # PowerMLP SwiGLU: replaces BayesianSwiGLUMLP (or SwiGLUMLP) with a PowerMLP-style gate.
+    # Gate activation = relu(gate)^n + silu(gate) — no extra parameters vs SwiGLUMLP.
+    # USE_POWER_MLP_SWIGLU=1 requires USE_SWIGLU=1. NoPE blocks are unaffected.
+    use_power_mlp_swiglu = bool(int(os.environ.get("USE_POWER_MLP_SWIGLU", "0")))
+    power_mlp_repu_order = int(os.environ.get("POWER_MLP_REPU_ORDER", "2"))
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))   # stride=64 → dense full-context scoring
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
@@ -187,6 +192,12 @@ class Hyperparameters:
     # Shared-V is automatically disabled for XSA blocks (their V dim differs from the shared proj).
     use_xsa = bool(int(os.environ.get("USE_XSA", "0")))
     xsa_layers = int(os.environ.get("XSA_LAYERS", "4"))
+    # ValueEmbedding: reinject token identity into V at specific decoder layers.
+    # VE_LAYERS is a comma-separated list of absolute layer indices (0-based).
+    # A shared embed table (vocab→ve_dim→kv_dim) + per-layer scale. Near-zero at init.
+    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
+    ve_dim = int(os.environ.get("VE_DIM", "128"))
+    ve_layers = os.environ.get("VE_LAYERS", "9,10")
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -929,13 +940,16 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
-    def forward(self, x: Tensor, shared_v_proj: "CastedLinear | None" = None) -> Tensor:
+    def forward(self, x: Tensor, shared_v_proj: "CastedLinear | None" = None, v_embed: "Tensor | None" = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         # Flash Attention 4 layout: (B, T, H, D) — no head-first transpose.
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         _v_proj = shared_v_proj if self.c_v is None else self.c_v
-        v = _v_proj(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v_flat = _v_proj(x)  # (B, T, kv_dim)
+        if v_embed is not None:
+            v_flat = v_flat + v_embed  # v_embed: (B, T, kv_dim) from ValueEmbedding
+        v = v_flat.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         # q_gain is per-head → dim=2 in (B, T, H, D)
@@ -1107,6 +1121,37 @@ class BayesianSwiGLUMLP(nn.Module):
         return self.down_proj(F.silu(gate) * val)
 
 
+class PowerMLPSwiGLU(nn.Module):
+    """SwiGLU FFN with a PowerMLP-style gate activation (iso-parametric with SwiGLUMLP).
+
+    Replaces the standard SiLU gate with a combined RePU + SiLU activation on the
+    same gate pre-activation — the PowerMLP "ResRePUBlock" pattern without an extra matrix:
+
+      gate     = gate_proj(x)
+      gate_act = relu(gate)^repu_order + silu(gate)   # RePU + SiLU residual on same logit
+      out      = down_proj(gate_act * val_proj(x))
+
+    USE_POWER_MLP_SWIGLU=1 (with USE_SWIGLU=1) selects this for RoPE blocks instead of
+    BayesianSwiGLUMLP. NoPE blocks keep their BayesReLUSquareMLP / MLP assignment.
+    POWER_MLP_REPU_ORDER sets the polynomial order (default 2 = ReLU²).
+    Zero extra parameters vs SwiGLUMLP — same three matrices.
+    """
+
+    def __init__(self, dim: int, hidden: int, repu_order: int = 2):
+        super().__init__()
+        self.gate_proj = CastedLinear(dim, hidden, bias=False)
+        self.val_proj  = CastedLinear(dim, hidden, bias=False)
+        self.down_proj = CastedLinear(hidden, dim, bias=False)
+        self.down_proj._zero_init = True
+        self.repu_order = repu_order
+
+    def forward(self, x: Tensor) -> Tensor:
+        gate = self.gate_proj(x)
+        # relu^n is the PowerMLP RePU; silu(gate) is the ResSiLU residual — same pre-activation.
+        gate_act = F.relu(gate).pow(self.repu_order) + F.silu(gate)
+        return self.down_proj(gate_act * self.val_proj(x))
+
+
 class SmearGate(nn.Module):
     """Blend each token's hidden state with the previous token's hidden state.
     A per-dim learned gate (init=0 → identity at start) controls the blend.
@@ -1155,6 +1200,34 @@ class BigramHashEmbedding(nn.Module):
 
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
+class ValueEmbedding(nn.Module):
+    """Reinject token identity into attention V at specific decoder layers.
+
+    A shared embedding table (vocab → ve_dim → kv_dim) with a per-layer learned
+    scale multiplier. Adds a low-rank residual to V that carries unattenuated token
+    identity forward — most useful in the final decoder layers where the U-Net skip
+    connection can dilute the current-token signal.
+
+    Init: embed ~ N(0, 0.01), proj = zero → near-zero delta at start, grows if useful.
+    scale is a shared scalar (0.1); per-layer multipliers are in GPT.ve_layer_scales.
+    """
+
+    def __init__(self, vocab_size: int, ve_dim: int, kv_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, ve_dim)
+        nn.init.normal_(self.embed.weight, std=0.01)
+        self.proj = CastedLinear(ve_dim, kv_dim, bias=False) if ve_dim != kv_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(token_ids)
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
@@ -1213,6 +1286,8 @@ class Block(nn.Module):
         use_shared_v: bool = False,
         use_lora: bool = False,
         lora_rank: int = 16,
+        use_power_mlp_swiglu: bool = False,
+        power_mlp_repu_order: int = 2,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1221,7 +1296,14 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, nope_heads=nope_heads, use_alibi=use_alibi, use_shared_v=use_shared_v)
         _swiglu_h = swiglu_hidden if swiglu_hidden > 0 else max(1, round(mlp_hidden * 2 / 3))
         _is_nope_block = (nope_heads == num_heads)  # fully NoPE block → use ReLU² MLP
-        if use_bayes_mlp and use_swiglu:
+        if use_power_mlp_swiglu and use_swiglu:
+            # PowerMLP SwiGLU: all blocks use it unless use_bayes_mlp=1, in which case
+            # NoPE blocks keep BayesReLUSquareMLP for architectural diversity.
+            if _is_nope_block and use_bayes_mlp:
+                self.mlp = BayesReLUSquareMLP(dim, mlp_hidden, prior_log_sigma)
+            else:
+                self.mlp = PowerMLPSwiGLU(dim, _swiglu_h, power_mlp_repu_order)
+        elif use_bayes_mlp and use_swiglu:
             if _is_nope_block:
                 self.mlp = BayesReLUSquareMLP(dim, mlp_hidden, prior_log_sigma)
             else:
@@ -1239,13 +1321,13 @@ class Block(nn.Module):
         # LN_SCALE: dampen normed activations by 1/sqrt(depth) to stabilize deep layers
         self.ln_scale_factor = 1.0 / math.sqrt(block_idx + 1) if ln_scale else 1.0
 
-    def forward(self, x: Tensor, x0: Tensor, shared_v_proj: "CastedLinear | None" = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, shared_v_proj: "CastedLinear | None" = None, v_embed: "Tensor | None" = None) -> Tensor:
         # Cast all float32 scale params once to match x.dtype (bfloat16 at train time).
         dt = x.dtype
         mix = self.resid_mix.to(dtype=dt)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         s = self.ln_scale_factor
-        attn_out = self.attn(self.attn_norm(x) * s, shared_v_proj=shared_v_proj)
+        attn_out = self.attn(self.attn_norm(x) * s, shared_v_proj=shared_v_proj, v_embed=v_embed)
         x = x + self.attn_scale.to(dtype=dt)[None, None, :] * attn_out
         mlp_out = self.mlp_scale.to(dtype=dt)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
         if self.lora is not None:
@@ -1278,6 +1360,8 @@ class GPT(nn.Module):
         use_alibi: bool = False,
         use_swiglu: bool = False,
         swiglu_hidden: int = 0,
+        use_power_mlp_swiglu: bool = False,
+        power_mlp_repu_order: int = 2,
         ln_scale: bool = False,
         backout_enabled: bool = False,
         backout_lambda_init: float = 0.2,
@@ -1294,6 +1378,9 @@ class GPT(nn.Module):
         lora_rank: int = 16,
         use_xsa: bool = False,
         xsa_layers: int = 4,
+        ve_enabled: bool = False,
+        ve_dim: int = 128,
+        ve_layers: str = "9,10",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1355,6 +1442,8 @@ class GPT(nn.Module):
                     use_shared_v=use_shared_value_emb,
                     use_lora=use_lora,
                     lora_rank=lora_rank,
+                    use_power_mlp_swiglu=use_power_mlp_swiglu,
+                    power_mlp_repu_order=power_mlp_repu_order,
                 )
                 for i in range(num_unique_blocks)
             ]
@@ -1363,6 +1452,18 @@ class GPT(nn.Module):
         if use_xsa:
             for blk in list(self.blocks)[-xsa_layers:]:
                 blk.attn.use_xsa = True
+        # ValueEmbedding: shared vocab table injects token identity into V at specific layers.
+        self.ve_layer_indices: list[int] = (
+            [int(s) for s in ve_layers.split(",") if s.strip()] if ve_enabled else []
+        )
+        if self.ve_layer_indices:
+            self.ve_shared: ValueEmbedding | None = ValueEmbedding(vocab_size, ve_dim, _kv_dim)
+            self.ve_layer_scales = nn.ParameterList(
+                [nn.Parameter(torch.ones(1, dtype=torch.float32)) for _ in self.ve_layer_indices]
+            )
+        else:
+            self.ve_shared = None
+            self.ve_layer_scales = nn.ParameterList()
         self.attnres: AttnRes | None = (
             AttnRes(model_dim, len(self.blocks), self._attnres_block_size)
             if self._use_attnres else None
@@ -1390,17 +1491,28 @@ class GPT(nn.Module):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
-    def _run_blocks(self, x: Tensor) -> Tensor:
+    def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict) -> "Tensor | None":
+        """Return ValueEmbedding delta for layer_idx, or None if VE is inactive for that layer."""
+        if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
+            return None
+        if "ve" not in ve_cache:
+            ve_cache["ve"] = self.ve_shared(input_ids)  # (B, T, kv_dim) — computed once
+        ve_idx = self.ve_layer_indices.index(layer_idx)
+        return ve_cache["ve"] * self.ve_layer_scales[ve_idx].to(dtype=ve_cache["ve"].dtype)
+
+    def _run_blocks(self, x: Tensor, input_ids: Tensor) -> Tensor:
         svp = self.shared_v_proj  # None or a shared CastedLinear for V projection
+        ve_cache: dict = {}
         if self.attnres is not None:
             # Kimi AttnRes mode: all blocks run linearly with inter-block depth attention.
             # The U-Net encoder/decoder split and skip connections are fully bypassed.
+            # VE is not threaded into AttnRes — enable attnres and VE simultaneously at your own risk.
             return self.attnres(self.blocks, x, shared_v_proj=svp)
         x0 = x
         skips: list[Tensor] = []
         x_backout: Tensor | None = None
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0, svp)
+            x = self.blocks[i](x, x0, svp, v_embed=self._get_ve(i, input_ids, ve_cache))
             skips.append(x)
             if self.backout_lambda is not None and i == self.backout_layer:
                 x_backout = x
@@ -1408,7 +1520,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             blk_idx = (self.num_encoder_layers - 1 - i) if self.share_weights else (self.num_encoder_layers + i)
-            x = self.blocks[blk_idx](x, x0, svp)
+            x = self.blocks[blk_idx](x, x0, svp, v_embed=self._get_ve(blk_idx, input_ids, ve_cache))
             if self.backout_lambda is not None and (self.num_encoder_layers + i) == self.backout_layer:
                 x_backout = x
         if x_backout is not None and self.backout_lambda is not None:
@@ -1421,7 +1533,7 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
-        hidden = self.final_norm(self._run_blocks(x))  # (B, T, D) — kept for MTP
+        hidden = self.final_norm(self._run_blocks(x, input_ids))  # (B, T, D) — kept for MTP
         h_flat = hidden.reshape(-1, hidden.size(-1))   # (B*T, D)
         targets = target_ids.reshape(-1)
         logits_proj = F.linear(h_flat, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(h_flat)
@@ -1443,7 +1555,7 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
-        x = self.final_norm(self._run_blocks(x))
+        x = self.final_norm(self._run_blocks(x, input_ids))
         logits_proj = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
@@ -1743,6 +1855,8 @@ def main() -> None:
         use_alibi=args.use_alibi,
         use_swiglu=args.use_swiglu,
         swiglu_hidden=args.swiglu_hidden,
+        use_power_mlp_swiglu=args.use_power_mlp_swiglu,
+        power_mlp_repu_order=args.power_mlp_repu_order,
         ln_scale=args.ln_scale,
         backout_enabled=args.backout_enabled,
         backout_lambda_init=args.backout_lambda_init,
@@ -1759,6 +1873,9 @@ def main() -> None:
         lora_rank=args.lora_rank,
         use_xsa=args.use_xsa,
         xsa_layers=args.xsa_layers,
+        ve_enabled=args.ve_enabled,
+        ve_dim=args.ve_dim,
+        ve_layers=args.ve_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1798,10 +1915,19 @@ def main() -> None:
         if base_model.bigram.proj is not None:
             matrix_params.append(base_model.bigram.proj.weight)
         scalar_params.append(base_model.bigram.scale)
+    # ValueEmbedding: embed.weight → tok Adam; proj.weight → matrix; scale + layer_scales → scalar
+    if base_model.ve_shared is not None:
+        if base_model.ve_shared.proj is not None:
+            matrix_params.append(base_model.ve_shared.proj.weight)
+        scalar_params.append(base_model.ve_shared.scale)
+        for ls in base_model.ve_layer_scales:
+            scalar_params.append(ls)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     _tok_emb_params = [base_model.tok_emb.weight]
     if base_model.bigram is not None:
         _tok_emb_params.append(base_model.bigram.embed.weight)
+    if base_model.ve_shared is not None:
+        _tok_emb_params.append(base_model.ve_shared.embed.weight)
     optimizer_tok = torch.optim.Adam(
         [{"params": _tok_emb_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1875,13 +2001,16 @@ def main() -> None:
     log0(f"pos_encoding:{'alibi' if args.use_alibi else ('rope+nope' if nope_heads > 0 else 'rope')}")
     _swiglu_h = args.swiglu_hidden if args.swiglu_hidden > 0 else max(1, round(args.mlp_hidden * 2 // 3))
     _mlp_variant = (
-        "BayesSwiGLU(RoPE)+BayesReLU²(NoPE)" if (args.use_bayes_mlp and args.use_swiglu) else
-        "BayesianMLP"                         if args.use_bayes_mlp else
-        "SwiGLU"                              if args.use_swiglu else
+        "PowerMLPSwiGLU(all)+BayesReLU²(NoPE)" if (args.use_power_mlp_swiglu and args.use_swiglu and args.use_bayes_mlp) else
+        "PowerMLPSwiGLU(all)"                  if (args.use_power_mlp_swiglu and args.use_swiglu) else
+        "BayesSwiGLU(RoPE)+BayesReLU²(NoPE)"  if (args.use_bayes_mlp and args.use_swiglu) else
+        "BayesianMLP"                          if args.use_bayes_mlp else
+        "SwiGLU"                               if args.use_swiglu else
         "ReLU²"
     )
     _mlp_detail = (
-        f"swiglu_hidden:{_swiglu_h} bayes_prior_log_sigma:{args.bayes_prior_log_sigma}" if (args.use_bayes_mlp and args.use_swiglu) else
+        f"swiglu_hidden:{_swiglu_h} repu_order:{args.power_mlp_repu_order}"              if (args.use_power_mlp_swiglu and args.use_swiglu) else
+        f"swiglu_hidden:{_swiglu_h} bayes_prior_log_sigma:{args.bayes_prior_log_sigma}"  if (args.use_bayes_mlp and args.use_swiglu) else
         f"bayes_prior_log_sigma:{args.bayes_prior_log_sigma}"                            if args.use_bayes_mlp else
         f"swiglu_hidden:{_swiglu_h}"                                                     if args.use_swiglu else
         f"mlp_hidden:{args.mlp_hidden}"

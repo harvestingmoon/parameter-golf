@@ -46,6 +46,10 @@ class Hyperparameters:
     # LR_WARMUP_STEPS: linear LR ramp from 0→1 over this many MAIN training steps.
     # Separate from WARMUP_STEPS (which is the ghost optimizer pre-warm that resets after).
     lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 0))
+    # LR_SWITCH_STEP: at this training step, multiply all base_lr values by LR_SWITCH_FACTOR.
+    # 0 = disabled. Useful for step-decay schedules (e.g., drop LR by 10× at 70% of training).
+    lr_switch_step = int(os.environ.get("LR_SWITCH_STEP", "0"))
+    lr_switch_factor = float(os.environ.get("LR_SWITCH_FACTOR", "0.1"))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -1297,10 +1301,10 @@ class Block(nn.Module):
         _swiglu_h = swiglu_hidden if swiglu_hidden > 0 else max(1, round(mlp_hidden * 2 / 3))
         _is_nope_block = (nope_heads == num_heads)  # fully NoPE block → use ReLU² MLP
         if use_power_mlp_swiglu and use_swiglu:
-            # PowerMLP SwiGLU: all blocks use it unless use_bayes_mlp=1, in which case
-            # NoPE blocks keep BayesReLUSquareMLP for architectural diversity.
+            # PowerMLP SwiGLU for RoPE blocks; BayesianSwiGLUMLP for NoPE blocks when
+            # use_bayes_mlp=1 (both honour the SwiGLU flag).
             if _is_nope_block and use_bayes_mlp:
-                self.mlp = BayesReLUSquareMLP(dim, mlp_hidden, prior_log_sigma)
+                self.mlp = BayesianSwiGLUMLP(dim, _swiglu_h, prior_log_sigma)
             else:
                 self.mlp = PowerMLPSwiGLU(dim, _swiglu_h, power_mlp_repu_order)
         elif use_bayes_mlp and use_swiglu:
@@ -2001,11 +2005,11 @@ def main() -> None:
     log0(f"pos_encoding:{'alibi' if args.use_alibi else ('rope+nope' if nope_heads > 0 else 'rope')}")
     _swiglu_h = args.swiglu_hidden if args.swiglu_hidden > 0 else max(1, round(args.mlp_hidden * 2 // 3))
     _mlp_variant = (
-        "PowerMLPSwiGLU(all)+BayesReLU²(NoPE)" if (args.use_power_mlp_swiglu and args.use_swiglu and args.use_bayes_mlp) else
-        "PowerMLPSwiGLU(all)"                  if (args.use_power_mlp_swiglu and args.use_swiglu) else
-        "BayesSwiGLU(RoPE)+BayesReLU²(NoPE)"  if (args.use_bayes_mlp and args.use_swiglu) else
-        "BayesianMLP"                          if args.use_bayes_mlp else
-        "SwiGLU"                               if args.use_swiglu else
+        "PowerMLPSwiGLU(RoPE)+BayesSwiGLU(NoPE)" if (args.use_power_mlp_swiglu and args.use_swiglu and args.use_bayes_mlp) else
+        "PowerMLPSwiGLU(all)"                     if (args.use_power_mlp_swiglu and args.use_swiglu) else
+        "BayesSwiGLU(RoPE)+BayesReLU²(NoPE)"     if (args.use_bayes_mlp and args.use_swiglu) else
+        "BayesianMLP"                             if args.use_bayes_mlp else
+        "SwiGLU"                                  if args.use_swiglu else
         "ReLU²"
     )
     _mlp_detail = (
@@ -2138,8 +2142,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        # STE int6 QAT: enable when LR has decayed to the late-phase threshold
-        if args.late_qat and not CastedLinear._qat_enabled and scale < args.late_qat_threshold:
+        # STE int6 QAT: enable when LR has decayed to the late-phase threshold.
+        # Guard: skip check during the LR warmup ramp (step < lr_warmup_steps) where
+        # scale starts at 0 and would spuriously trigger the threshold test.
+        _past_warmup = step >= max(args.lr_warmup_steps, 1)
+        if args.late_qat and not CastedLinear._qat_enabled and _past_warmup and scale < args.late_qat_threshold:
             CastedLinear._qat_enabled = True
             log0(f"qat:enabling int6 STE at step:{step} lr_scale:{scale:.4f}")
         zero_grad_all()
@@ -2162,6 +2169,13 @@ def main() -> None:
                 group["beta"] = muon_beta1
             else:
                 group["momentum"] = muon_beta1
+
+        # LR switch: one-time base_lr rescale at the configured step
+        if args.lr_switch_step > 0 and step == args.lr_switch_step:
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["base_lr"] *= args.lr_switch_factor
+            log0(f"lr_switch:step:{step} factor:{args.lr_switch_factor}")
 
         for opt in optimizers:
             for group in opt.param_groups:

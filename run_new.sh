@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${SCRIPT_DIR}/.venv/bin/python3"
+NPROC="${NPROC:-1}"
+
+if [ "$NPROC" -gt 1 ]; then
+    LAUNCHER=("$PYTHON" -m torch.distributed.run --nproc_per_node="$NPROC" --standalone)
+else
+    LAUNCHER=("$PYTHON")
+fi
+
+
+# head LR same as matrix LR, tied embed LR same as embed LR
+
+RUN_ID="olion_$(date +%Y%m%d_%H%M)" \
+LARGE_GPU="${LARGE_GPU:-0}" \
+FLASH_ATTN="${FLASH_ATTN:-0}" \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+\
+NUM_LAYERS=11 \
+MODEL_DIM=512 \
+NUM_HEADS=8 \
+NUM_KV_HEADS=4 \
+MLP_HIDDEN=1536 \
+TRAIN_BATCH_TOKENS=65536 \
+TRAIN_SEQ_LEN=1024 \
+ITERATIONS=200 \
+WARMDOWN_ITERS=50 \
+WARMUP_STEPS=20 \
+LR_WARMUP_STEPS=30 \
+MAX_WALLCLOCK_SECONDS=0 \
+GRAD_ACCUM_TARGET=8 \
+MATRIX_LR=0.08 \
+SCALAR_LR=0.01 \
+EMBED_LR=0.03 \
+TIED_EMBED_LR=0.03 \
+HEAD_LR=0.08 \
+MUON_MOMENTUM=0.99 \
+MUON_MOMENTUM_WARMUP_STEPS=10 \
+\
+LN_SCALE=1 \
+BACKOUT_ENABLED=1 \
+BACKOUT_LAMBDA_INIT=0.12 \
+BACKOUT_LAYER=2 \
+NOPE_RATIO=0.25 \
+NOPE_MODE=block \
+\
+VAL_LOSS_EVERY=50 \
+VAL_BATCH_SIZE=65536 \
+TRAIN_LOG_EVERY=20 \
+SKIP_SLIDING_EVAL=1 \
+EVAL_STRIDE=512 \
+EVAL_BATCH_SEQS=32 \
+\
+EMA_ENABLED=0 \
+EMA_DECAY=0.997 \
+SWA_ENABLED=0 \
+SWA_EVERY=10 \
+USE_OLION=1 \
+OLION_BETA1=0.9 \
+USE_ADAMUON=0 \
+USE_LION=1 \
+\
+LATE_QAT=1 \
+LATE_QAT_THRESHOLD=0.70 \
+QAT_ENABLED=0 \
+PRUNE_PCT=0.03 \
+INT6_LAST_N=0 \
+USE_FOCAL=1 \
+FOCAL_GAMMA=0.45 \
+\
+"${LAUNCHER[@]}" train_gpt.py 2>&1 | tee "logs/smoke_test_$(date +%Y%m%d_%H%M).txt"
